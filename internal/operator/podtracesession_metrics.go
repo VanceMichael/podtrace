@@ -2,7 +2,6 @@ package operator
 
 import (
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -17,89 +16,56 @@ var (
 	reportUploadAttempts = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "podtrace_operator",
 		Name:      "session_report_upload_attempts_total",
-		Help: "Terminal outcomes of the objectStore uploader sidecar. " +
+		Help: "Terminal per-node outcomes of the objectStore uploader sidecar. " +
 			"backend ∈ {s3,gs,azblob}, result ∈ {success,failure}, " +
 			"reason ∈ ReportFailureReason enum (empty when result=success). " +
-			"Compare rate(result=failure) vs rate(result=success) for an SLO; " +
+			"Exactly one sample is recorded per node when that node's upload " +
+			"state first becomes Succeeded or Failed; repeated reconciles and " +
+			"operator restarts do not re-count it. " +
+		"Compare rate(result=failure) vs rate(result=success) for an SLO; " +
 			"sum by (reason) to find the dominant failure mode.",
 	}, []string{"backend", "result", "reason"})
 
 	reportUploadDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Namespace: "podtrace_operator",
 		Name:      "session_report_upload_duration_seconds",
-		Help: "Time from session start to terminal objectStore sidecar outcome. " +
-			"Buckets sized for typical small reports (under 100KB) with headroom " +
-			"for occasional slow tails. Use histogram_quantile(0.95, …) to track " +
-			"the long tail.",
+		Help: "Time from session start to a per-node terminal objectStore " +
+			"sidecar outcome. Buckets sized for typical small reports (under " +
+			"100KB) with headroom for occasional slow tails. Use " +
+			"histogram_quantile(0.95, …) to track the long tail.",
 		Buckets: []float64{0.5, 1, 2, 5, 10, 20, 30, 60, 120, 300, 600},
 	}, []string{"backend", "result"})
-
-	observed = struct {
-		sync.Mutex
-		seen map[reportObservationKey]struct{}
-	}{seen: map[reportObservationKey]struct{}{}}
 )
-
-type reportObservationKey struct {
-	Namespace string
-	Name      string
-	Attempts  int32
-	Succeeded bool
-}
 
 func init() {
 	ctrlmetrics.Registry.MustRegister(reportUploadAttempts, reportUploadDuration)
 }
 
-// observeReportUploadMetrics records one Prometheus observation per
-// terminal sidecar outcome. Safe to call on every reconcile: it
-// deduplicates against (namespace/name/attempts/succeeded) so repeated
-// calls for the same outcome only count once.
-func observeReportUploadMetrics(s *podtracev1alpha1.PodTraceSession, obs reportUploadObservation) {
+// observeNodeReportMetrics records one Prometheus observation per
+// node-level terminal transition. Callers pass only the transitions a
+// reconcile actually produced (derived by comparing the prior,
+// already-persisted per-node status with the merged status), and only
+// after the new status persists successfully. That makes recording
+// idempotent across repeated reconciles AND operator restarts with no
+// in-memory dedup state: a re-run after a failed/conflicted status
+// update recomputes transitions against the unmodified persisted state
+// and emits nothing twice.
+func observeNodeReportMetrics(s *podtracev1alpha1.PodTraceSession, transitions []nodeReportTransition) {
 	if s == nil || s.Spec.ReportRef == nil || s.Spec.ReportRef.ObjectStore == nil {
 		return
 	}
-	if !obs.Terminated {
-		return
-	}
-	key := reportObservationKey{
-		Namespace: s.Namespace,
-		Name:      s.Name,
-		Attempts:  obs.Attempts,
-		Succeeded: obs.Succeeded,
-	}
-	observed.Lock()
-	if _, alreadyCounted := observed.seen[key]; alreadyCounted {
-		observed.Unlock()
-		return
-	}
-	observed.seen[key] = struct{}{}
-	observed.Unlock()
-
 	backend := backendFromURI(s.Spec.ReportRef.ObjectStore.URI)
-	result := "success"
-	reason := ""
-	if !obs.Succeeded {
-		result = "failure"
-		reason = string(classifyUploadFailure(obs.ResolvedURI))
-	}
-	reportUploadAttempts.WithLabelValues(backend, result, reason).Inc()
-
-	if duration := uploadDurationSeconds(s); duration > 0 {
-		reportUploadDuration.WithLabelValues(backend, result).Observe(duration)
-	}
-}
-
-// forgetReportObservations clears the dedup-set for a session when
-// the operator garbage-collects it. Bounded-memory hygiene so a
-// long-running operator does not retain entries for thousands of
-// completed sessions forever.
-func forgetReportObservations(namespace, name string) {
-	observed.Lock()
-	defer observed.Unlock()
-	for k := range observed.seen {
-		if k.Namespace == namespace && k.Name == name {
-			delete(observed.seen, k)
+	for i := range transitions {
+		t := &transitions[i]
+		result := "success"
+		reason := ""
+		if !t.Succeeded {
+			result = "failure"
+			reason = string(classifyUploadFailure(t.Message))
+		}
+		reportUploadAttempts.WithLabelValues(backend, result, reason).Inc()
+		if duration := uploadDurationSeconds(s); duration > 0 {
+			reportUploadDuration.WithLabelValues(backend, result).Observe(duration)
 		}
 	}
 }

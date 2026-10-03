@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"sort"
 	"strings"
 	"time"
@@ -81,7 +82,6 @@ func (r *PodTraceSessionReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	var session podtracev1alpha1.PodTraceSession
 	if err := r.Get(ctx, req.NamespacedName, &session); err != nil {
 		if apierrors.IsNotFound(err) {
-			forgetReportObservations(req.Namespace, req.Name)
 			return ctrl.Result{}, nil
 		}
 		return ctrl.Result{}, fmt.Errorf("get PodTraceSession: %w", err)
@@ -103,7 +103,6 @@ func (r *PodTraceSessionReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 				return ctrl.Result{}, err
 			}
 		}
-		forgetReportObservations(session.Namespace, session.Name)
 		if removeFinalizer(&session) {
 			if err := r.Update(ctx, &session); err != nil {
 				if res, handled := finalizerUpdateOutcome(err); handled {
@@ -174,7 +173,6 @@ func (r *PodTraceSessionReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		return ctrl.Result{}, err
 	}
 	tc := resolved.primary()
-	systemNS := systemNamespaceForSession(tc, r.SystemNamespace)
 
 	var ec podtracev1alpha1.ExporterConfig
 	hasExporter := session.Spec.ExporterRef.Name != ""
@@ -275,11 +273,11 @@ func (r *PodTraceSessionReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	r.setCondition(&session, ConditionReconciled, metav1.ConditionTrue, "Reconciled", reconciledMessage)
 	r.setCondition(&session, ConditionDegraded, metav1.ConditionFalse, "Reconciled", "")
 
-	if obs, err := harvestReportLocation(ctx, r.Client, &session, systemNS); err != nil {
-		logger.Error(err, "harvest report location")
+	var reportTransitions []nodeReportTransition
+	if obs, err := harvestNodeReportObservations(ctx, r.Client, &session, resolved.namespaces); err != nil {
+		logger.Error(err, "harvest per-node report uploads")
 	} else {
-		applyReportUploadStatus(&session, obs)
-		observeReportUploadMetrics(&session, obs)
+		reportTransitions = applyReportUploadStatus(&session, obs)
 	}
 
 	if err := r.Status().Update(ctx, &session); err != nil {
@@ -288,9 +286,13 @@ func (r *PodTraceSessionReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		}
 		return ctrl.Result{}, fmt.Errorf("update status: %w", err)
 	}
+	// Emit per-node outcome metrics only after the transition persisted;
+	// conflict-driven retries recompute transitions against the unchanged
+	// persisted status and therefore never double-count.
+	observeNodeReportMetrics(&session, reportTransitions)
 
 	if !isTerminal(session.Status.State) {
-		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		return ctrl.Result{RequeueAfter: uploadReportPollInterval}, nil
 	}
 	return ctrl.Result{}, nil
 }
@@ -642,20 +644,103 @@ func (r *PodTraceSessionReconciler) ensureJobs(ctx context.Context, s *podtracev
 	return owned, nil
 }
 
-// reconcileTerminalSession handles TTL-driven cleanup only.
+// uploadReportPollInterval is how quickly a session re-reconciles
+// while per-node uploaders are still draining, including after the
+// session itself is Completed/Failed: a finished Job is not a
+// converged report.
+const uploadReportPollInterval = 5 * time.Second
+
+// reconcileTerminalSession keeps harvesting unfinished objectStore
+// uploaders after the session reaches Completed/Failed and only then
+// applies TTL-driven cleanup. The TTL countdown never deletes the
+// session (whose finalizer owns the per-node Jobs and Pods) while the
+// report result is still Unknown: those Pods are the sole evidence for
+// nodes whose uploader has not concluded.
 func (r *PodTraceSessionReconciler) reconcileTerminalSession(ctx context.Context, s *podtracev1alpha1.PodTraceSession) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+
+	if s.Spec.ReportRef != nil && s.Spec.ReportRef.ObjectStore != nil {
+		if res, err := r.reconcileTerminalReportUploads(ctx, s); err != nil {
+			return res, err
+		}
+	}
+
 	if s.Status.CompletionTime == nil {
 		return ctrl.Result{}, nil
 	}
 	ttl := sessionTTL(s)
 	deadline := s.Status.CompletionTime.Add(time.Duration(ttl) * time.Second)
-	if time.Now().Before(deadline) {
-		return ctrl.Result{RequeueAfter: time.Until(deadline)}, nil
+	now := r.now()
+	if now.Before(deadline) {
+		wait := deadline.Sub(now)
+		if reportUploadAwaited(s) && wait > uploadReportPollInterval {
+			wait = uploadReportPollInterval
+		}
+		return ctrl.Result{RequeueAfter: wait}, nil
+	}
+	if reportUploadAwaited(s) {
+		logger.Info("session TTL expired while report upload is still unresolved; retaining session and uploader Pod evidence until every node concludes",
+			"podtracesession", s.Namespace+"/"+s.Name,
+			"pendingNodes", pendingReportNodes(s))
+		return ctrl.Result{RequeueAfter: uploadReportPollInterval}, nil
 	}
 	if err := r.Delete(ctx, s); err != nil && !apierrors.IsNotFound(err) {
 		return ctrl.Result{}, fmt.Errorf("delete expired session: %w", err)
 	}
 	return ctrl.Result{}, nil
+}
+
+// reconcileTerminalReportUploads harvests uploader sidecars for an
+// already-terminal session, persists per-node conclusions, and emits
+// metrics only for node-level transitions that actually persisted.
+func (r *PodTraceSessionReconciler) reconcileTerminalReportUploads(ctx context.Context, s *podtracev1alpha1.PodTraceSession) (ctrl.Result, error) {
+	tc, err := r.resolveTracerConfig(ctx)
+	if err != nil {
+		log.FromContext(ctx).Info("TracerConfig unreadable during terminal report harvest; using fallback system namespace",
+			"podtracesession", s.Namespace+"/"+s.Name, "error", err.Error())
+		tc = nil
+	}
+	systemNS := systemNamespaceForSession(tc, r.SystemNamespace)
+	namespaces, err := sessionChildNamespaces(ctx, r.Client, s, candidateSystemNamespaces(systemNS, r.SystemNamespace))
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	obs, err := harvestNodeReportObservations(ctx, r.Client, s, namespaces)
+	if err != nil {
+		// Never let an observation error rush TTL into deleting the
+		// only evidence; come back quickly.
+		log.FromContext(ctx).Error(err, "harvest per-node report uploads for terminal session",
+			"podtracesession", s.Namespace+"/"+s.Name)
+		return ctrl.Result{RequeueAfter: uploadReportPollInterval}, nil
+	}
+
+	before := s.Status.DeepCopy()
+	transitions := applyReportUploadStatus(s, obs)
+	if reflect.DeepEqual(before, &s.Status) {
+		return ctrl.Result{}, nil
+	}
+	if err := r.Status().Update(ctx, s); err != nil {
+		if apierrors.IsConflict(err) {
+			return ctrl.Result{RequeueAfter: time.Second}, nil
+		}
+		return ctrl.Result{}, fmt.Errorf("update terminal session status: %w", err)
+	}
+	observeNodeReportMetrics(s, transitions)
+	return ctrl.Result{}, nil
+}
+
+// pendingReportNodes returns the sorted names of nodes whose per-node
+// upload is not terminal yet, for logging while TTL is held.
+func pendingReportNodes(s *podtracev1alpha1.PodTraceSession) []string {
+	var out []string
+	for i := range s.Status.NodeReports {
+		if !nodeReportTerminal(s.Status.NodeReports[i].State) {
+			out = append(out, s.Status.NodeReports[i].Node)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 func sessionTTL(s *podtracev1alpha1.PodTraceSession) int32 {

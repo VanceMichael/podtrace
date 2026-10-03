@@ -15,11 +15,47 @@ Once the upload succeeds, the operator surfaces:
 
 - `status.reportLocation` — the resolved object URI, e.g.
   `s3://my-bucket/reports/diag-abc-2026-05-13T12-34-56Z.txt`
+  (single-node sessions only).
 - `status.conditions[type=ReportUploaded]` —
   - `True` (`ObjectStoreUploadSucceeded`) when the upload landed.
   - `False` (`ObjectStoreUploadFailed`) when the sidecar exited non-zero;
     `message` carries the sidecar's stderr.
   - `Unknown` (`UploadPending`) while the sidecar is still running.
+
+## Multi-node sessions
+
+A session fans out one Job per node, and each node uploads its own
+report independently. The session-level result is therefore tracked
+**per node** in `status.nodeReports` (map keyed by `node`):
+
+- `state` — `Pending` until that node's uploader terminates, then
+  `Succeeded` or `Failed`; terminal entries are sticky and survive
+  uploader Pod TTL garbage-collection and operator restarts.
+- `location` — the resolved object URI for a succeeded node.
+- `failureReason` — the stable failure enum for a failed node, with the
+  free-text error in `message`.
+- `attempts` — the highest uploader restart count observed for the node.
+
+The `ReportUploaded` condition converges only after **every** node the
+session originally fanned out to is `Succeeded` or `Failed`: all
+succeeded gives `True`, any failure gives `False` (partial failures list
+both the succeeded locations and the failed reasons in the condition
+message). A node finishing early never decides the session while other
+uploaders are still running, and the outcome does not depend on Pod
+list ordering.
+
+The session's `ttlSecondsAfterFinished` countdown cannot delete the
+session while `ReportUploaded` is still `Unknown`: the uploader Pods are
+the only evidence for nodes that have not concluded, so cleanup waits
+until the aggregate result converges. The operator keeps reconciling
+uploaders after the session itself is `Completed`/`Failed`; a finished
+Job does not imply a converged report. After an operator restart the
+same conclusion is reconstructed from live Pods plus the persisted
+`status.nodeReports`.
+
+Single-node sessions continue to populate the scalar
+`status.reportLocation`, `status.reportFailureReason`, and
+`status.reportAttempts` fields as before.
 
 ## When to use
 

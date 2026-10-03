@@ -113,6 +113,8 @@ func ForKind(kind schema.GroupVersionKind) interface{} {
 		return &apiv1alpha1.SecretKeySelectorApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("SessionJobRef"):
 		return &apiv1alpha1.SessionJobRefApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("SessionNodeReport"):
+		return &apiv1alpha1.SessionNodeReportApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("SessionRuntimeSpec"):
 		return &apiv1alpha1.SessionRuntimeSpecApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("SessionSummary"):

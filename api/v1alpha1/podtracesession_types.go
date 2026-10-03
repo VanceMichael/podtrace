@@ -33,6 +33,18 @@ const (
 	SessionStateFailed    SessionState = "Failed"
 )
 
+// NodeReportUploadState is the per-node state of an objectStore report
+// upload. Pending means the node's uploader has not reached a terminal
+// result yet; Succeeded and Failed are sticky, per-node conclusions.
+// +kubebuilder:validation:Enum=Pending;Succeeded;Failed
+type NodeReportUploadState string
+
+const (
+	NodeReportPending   NodeReportUploadState = "Pending"
+	NodeReportSucceeded NodeReportUploadState = "Succeeded"
+	NodeReportFailed    NodeReportUploadState = "Failed"
+)
+
 // PodTraceSessionSpec defines a bounded diagnose-mode trace. The operator
 // reconciles this into one privileged Job per node hosting matched pods.
 // +kubebuilder:validation:XValidation:rule="[has(self.selector), has(self.podRefs)].filter(x, x).size() == 1",message="exactly one of spec.selector or spec.podRefs must be set"
@@ -104,6 +116,44 @@ type SessionJobRef struct {
 	Message string `json:"message,omitempty"`
 }
 
+// SessionNodeReport is the per-node objectStore upload outcome for a
+// session that fans out one Job per node. Entries are keyed by node and
+// merged across reconciles; a Succeeded or Failed state is sticky and
+// survives uploader Pod TTL garbage-collection and operator restarts.
+// On partial failure, succeeded nodes keep their Location while failed
+// nodes keep their FailureReason, and the session's ReportUploaded
+// condition converges to False only once every expected node is
+// terminal.
+type SessionNodeReport struct {
+	// Node is the name of the node whose Job produced the report.
+	// +kubebuilder:validation:Required
+	Node string `json:"node"`
+
+	// State is the uploader's current conclusion for this node.
+	// +optional
+	State NodeReportUploadState `json:"state,omitempty"`
+
+	// Location is the resolved object URI once this node's upload
+	// succeeded.
+	// +optional
+	Location string `json:"location,omitempty"`
+
+	// FailureReason is the stable failure enum once this node's upload
+	// has finally failed.
+	// +optional
+	FailureReason ReportFailureReason `json:"failureReason,omitempty"`
+
+	// Attempts is the highest uploader attempt (restart count) observed
+	// for this node.
+	// +optional
+	Attempts int32 `json:"attempts,omitempty"`
+
+	// Message carries the uploader's terminal free-text: the resolved
+	// URI on success, the error text on failure.
+	// +optional
+	Message string `json:"message,omitempty"`
+}
+
 // SessionSummary is a compact roll-up of what the session observed.
 type SessionSummary struct {
 	TotalEvents int64 `json:"totalEvents"`
@@ -146,6 +196,23 @@ type PodTraceSessionStatus struct {
 
 	// +optional
 	ReportAttempts int32 `json:"reportAttempts,omitempty"`
+
+	// NodeReports holds one objectStore upload outcome per node the
+	// session originally fanned out to, keyed by node and merged across
+	// reconciles. Terminal entries (Succeeded/Failed) are sticky, so
+	// successful locations and stable failure reasons survive uploader
+	// Pod TTL garbage-collection and operator restarts. The
+	// ReportUploaded condition stays Unknown until every expected node
+	// is Succeeded or Failed; on partial failure both the successful
+	// locations and failed reasons remain available here. Single-node
+	// sessions additionally populate the scalar reportLocation /
+	// reportFailureReason / reportAttempts fields.
+	// +optional
+	// +patchMergeKey=node
+	// +patchStrategy=merge
+	// +listType=map
+	// +listMapKey=node
+	NodeReports []SessionNodeReport `json:"nodeReports,omitempty" patchStrategy:"merge" patchMergeKey:"node"`
 
 	// +optional
 	// +patchMergeKey=type

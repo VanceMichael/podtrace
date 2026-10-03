@@ -146,6 +146,7 @@ func TestHarvestReportLocation(t *testing.T) {
 				Labels: map[string]string{
 					LabelSessionName: "diag",
 					LabelSessionNS:   "default",
+					LabelNodeName:    "node-a",
 				},
 			},
 			Status: corev1.PodStatus{
@@ -159,8 +160,7 @@ func TestHarvestReportLocation(t *testing.T) {
 	cases := []struct {
 		name         string
 		pod          *corev1.Pod
-		wantTerm     bool
-		wantOK       bool
+		wantRank     int
 		wantURI      string
 		wantCondStat metav1.ConditionStatus
 	}{
@@ -169,7 +169,7 @@ func TestHarvestReportLocation(t *testing.T) {
 			pod: mkPod(corev1.ContainerState{
 				Running: &corev1.ContainerStateRunning{StartedAt: metav1.Now()},
 			}),
-			wantTerm:     false,
+			wantRank:     observationPending,
 			wantCondStat: metav1.ConditionUnknown,
 		},
 		{
@@ -180,8 +180,7 @@ func TestHarvestReportLocation(t *testing.T) {
 					Message:  "s3://b/reports/sess.txt",
 				},
 			}),
-			wantTerm:     true,
-			wantOK:       true,
+			wantRank:     observationSucceeded,
 			wantURI:      "s3://b/reports/sess.txt",
 			wantCondStat: metav1.ConditionTrue,
 		},
@@ -193,8 +192,7 @@ func TestHarvestReportLocation(t *testing.T) {
 					Message:  "upload report: dial tcp: lookup b: no such host",
 				},
 			}),
-			wantTerm:     true,
-			wantOK:       false,
+			wantRank:     observationFinalFailure,
 			wantURI:      "upload report: dial tcp: lookup b: no such host",
 			wantCondStat: metav1.ConditionFalse,
 		},
@@ -204,32 +202,33 @@ func TestHarvestReportLocation(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			s := sessionWithObjectStore("")
 			c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(tc.pod).Build()
-			obs, err := harvestReportLocation(context.Background(), c, s, "podtrace-system")
+			obs, err := harvestNodeReportObservations(context.Background(), c, s, []string{"podtrace-system"})
 			if err != nil {
 				t.Fatalf("harvest: %v", err)
 			}
-			if obs.Terminated != tc.wantTerm || obs.Succeeded != tc.wantOK || obs.ResolvedURI != tc.wantURI {
-				t.Errorf("got (uri=%q, term=%v, ok=%v); want (uri=%q, term=%v, ok=%v)",
-					obs.ResolvedURI, obs.Terminated, obs.Succeeded, tc.wantURI, tc.wantTerm, tc.wantOK)
+			got := obs["node-a"]
+			if got.Rank != tc.wantRank || got.Message != tc.wantURI {
+				t.Errorf("got (uri=%q, rank=%d); want (uri=%q, rank=%d)",
+					got.Message, got.Rank, tc.wantURI, tc.wantRank)
 			}
 			applyReportUploadStatus(s, obs)
-			var got *metav1.Condition
+			var cond *metav1.Condition
 			for i := range s.Status.Conditions {
 				if s.Status.Conditions[i].Type == ConditionReportUploaded {
-					got = &s.Status.Conditions[i]
+					cond = &s.Status.Conditions[i]
 				}
 			}
-			if got == nil {
+			if cond == nil {
 				t.Fatal("ReportUploaded condition not set")
 				return
 			}
-			if got.Status != tc.wantCondStat {
-				t.Errorf("condition status = %q, want %q", got.Status, tc.wantCondStat)
+			if cond.Status != tc.wantCondStat {
+				t.Errorf("condition status = %q, want %q", cond.Status, tc.wantCondStat)
 			}
-			if tc.wantOK && s.Status.ReportLocation != tc.wantURI {
+			if tc.wantRank == observationSucceeded && s.Status.ReportLocation != tc.wantURI {
 				t.Errorf("status.reportLocation = %q, want %q", s.Status.ReportLocation, tc.wantURI)
 			}
-			if !tc.wantOK && s.Status.ReportLocation != "" {
+			if tc.wantRank == observationFinalFailure && s.Status.ReportLocation != "" {
 				t.Errorf("status.reportLocation must stay empty on failure, got %q", s.Status.ReportLocation)
 			}
 		})
@@ -249,14 +248,14 @@ func TestHarvestReportLocation_NonObjectStoreIsNoop(t *testing.T) {
 			},
 		},
 	}
-	obs, err := harvestReportLocation(context.Background(), c, s, "podtrace-system")
-	if err != nil || obs.ResolvedURI != "" || obs.Terminated || obs.Succeeded {
+	obs, err := harvestNodeReportObservations(context.Background(), c, s, []string{"podtrace-system"})
+	if err != nil || len(obs) != 0 {
 		t.Errorf("expected silent no-op, got %+v err=%v", obs, err)
 	}
 	applyReportUploadStatus(s, obs)
-	for _, c := range s.Status.Conditions {
-		if c.Type == ConditionReportUploaded {
-			t.Errorf("non-ObjectStore session must not get a ReportUploaded condition: %+v", c)
+	for _, cond := range s.Status.Conditions {
+		if cond.Type == ConditionReportUploaded {
+			t.Errorf("non-ObjectStore session must not get a ReportUploaded condition: %+v", cond)
 		}
 	}
 }

@@ -442,6 +442,76 @@ spec:
                 x-kubernetes-list-map-keys:
                 - node
                 x-kubernetes-list-type: map
+              nodeReports:
+                description: |-
+                  NodeReports holds one objectStore upload outcome per node the
+                  session originally fanned out to, keyed by node and merged across
+                  reconciles. Terminal entries (Succeeded/Failed) are sticky, so
+                  successful locations and stable failure reasons survive uploader
+                  Pod TTL garbage-collection and operator restarts. The
+                  ReportUploaded condition stays Unknown until every expected node
+                  is Succeeded or Failed; on partial failure both the successful
+                  locations and failed reasons remain available here. Single-node
+                  sessions additionally populate the scalar reportLocation /
+                  reportFailureReason / reportAttempts fields.
+                items:
+                  description: |-
+                    SessionNodeReport is the per-node objectStore upload outcome for a
+                    session that fans out one Job per node. Entries are keyed by node and
+                    merged across reconciles; a Succeeded or Failed state is sticky and
+                    survives uploader Pod TTL garbage-collection and operator restarts.
+                    On partial failure, succeeded nodes keep their Location while failed
+                    nodes keep their FailureReason, and the session's ReportUploaded
+                    condition converges to False only once every expected node is
+                    terminal.
+                  properties:
+                    attempts:
+                      description: |-
+                        Attempts is the highest uploader attempt (restart count) observed
+                        for this node.
+                      format: int32
+                      type: integer
+                    failureReason:
+                      description: |-
+                        FailureReason is the stable failure enum once this node's upload
+                        has finally failed.
+                      enum:
+                      - InvalidURI
+                      - CredentialMissing
+                      - BucketNotFound
+                      - AccessDenied
+                      - NetworkTimeout
+                      - Unknown
+                      type: string
+                    location:
+                      description: |-
+                        Location is the resolved object URI once this node's upload
+                        succeeded.
+                      type: string
+                    message:
+                      description: |-
+                        Message carries the uploader's terminal free-text: the resolved
+                        URI on success, the error text on failure.
+                      type: string
+                    node:
+                      description: Node is the name of the node whose Job produced
+                        the report.
+                      type: string
+                    state:
+                      description: State is the uploader's current conclusion for
+                        this node.
+                      enum:
+                      - Pending
+                      - Succeeded
+                      - Failed
+                      type: string
+                  required:
+                  - node
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - node
+                x-kubernetes-list-type: map
               observedGeneration:
                 format: int64
                 type: integer

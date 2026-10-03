@@ -28,18 +28,29 @@ import (
 //
 // PodTraceSessionStatus reflects the observed state of a PodTraceSession.
 type PodTraceSessionStatusApplyConfiguration struct {
-	State               *apiv1alpha1.SessionState            `json:"state,omitempty"`
-	StartTime           *v1.Time                             `json:"startTime,omitempty"`
-	CompletionTime      *v1.Time                             `json:"completionTime,omitempty"`
-	Jobs                []SessionJobRefApplyConfiguration    `json:"jobs,omitempty"`
-	Summary             *SessionSummaryApplyConfiguration    `json:"summary,omitempty"`
-	TargetNamespaces    []string                             `json:"targetNamespaces,omitempty"`
-	ReportLocation      *string                              `json:"reportLocation,omitempty"`
-	ReportFailureReason *apiv1alpha1.ReportFailureReason     `json:"reportFailureReason,omitempty"`
-	ReportAttempts      *int32                               `json:"reportAttempts,omitempty"`
-	Conditions          []metav1.ConditionApplyConfiguration `json:"conditions,omitempty"`
-	ObservedGeneration  *int64                               `json:"observedGeneration,omitempty"`
-	Policy              *PolicyStatusApplyConfiguration      `json:"policy,omitempty"`
+	State               *apiv1alpha1.SessionState         `json:"state,omitempty"`
+	StartTime           *v1.Time                          `json:"startTime,omitempty"`
+	CompletionTime      *v1.Time                          `json:"completionTime,omitempty"`
+	Jobs                []SessionJobRefApplyConfiguration `json:"jobs,omitempty"`
+	Summary             *SessionSummaryApplyConfiguration `json:"summary,omitempty"`
+	TargetNamespaces    []string                          `json:"targetNamespaces,omitempty"`
+	ReportLocation      *string                           `json:"reportLocation,omitempty"`
+	ReportFailureReason *apiv1alpha1.ReportFailureReason  `json:"reportFailureReason,omitempty"`
+	ReportAttempts      *int32                            `json:"reportAttempts,omitempty"`
+	// NodeReports holds one objectStore upload outcome per node the
+	// session originally fanned out to, keyed by node and merged across
+	// reconciles. Terminal entries (Succeeded/Failed) are sticky, so
+	// successful locations and stable failure reasons survive uploader
+	// Pod TTL garbage-collection and operator restarts. The
+	// ReportUploaded condition stays Unknown until every expected node
+	// is Succeeded or Failed; on partial failure both the successful
+	// locations and failed reasons remain available here. Single-node
+	// sessions additionally populate the scalar reportLocation /
+	// reportFailureReason / reportAttempts fields.
+	NodeReports        []SessionNodeReportApplyConfiguration `json:"nodeReports,omitempty"`
+	Conditions         []metav1.ConditionApplyConfiguration  `json:"conditions,omitempty"`
+	ObservedGeneration *int64                                `json:"observedGeneration,omitempty"`
+	Policy             *PolicyStatusApplyConfiguration       `json:"policy,omitempty"`
 }
 
 // PodTraceSessionStatusApplyConfiguration constructs a declarative configuration of the PodTraceSessionStatus type for use with
@@ -124,6 +135,19 @@ func (b *PodTraceSessionStatusApplyConfiguration) WithReportFailureReason(value 
 // If called multiple times, the ReportAttempts field is set to the value of the last call.
 func (b *PodTraceSessionStatusApplyConfiguration) WithReportAttempts(value int32) *PodTraceSessionStatusApplyConfiguration {
 	b.ReportAttempts = &value
+	return b
+}
+
+// WithNodeReports adds the given value to the NodeReports field in the declarative configuration
+// and returns the receiver, so that objects can be build by chaining "With" function invocations.
+// If called multiple times, values provided by each call will be appended to the NodeReports field.
+func (b *PodTraceSessionStatusApplyConfiguration) WithNodeReports(values ...*SessionNodeReportApplyConfiguration) *PodTraceSessionStatusApplyConfiguration {
+	for i := range values {
+		if values[i] == nil {
+			panic("nil value passed to WithNodeReports")
+		}
+		b.NodeReports = append(b.NodeReports, *values[i])
+	}
 	return b
 }
 

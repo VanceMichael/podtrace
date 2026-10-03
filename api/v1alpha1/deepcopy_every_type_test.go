@@ -60,6 +60,7 @@ func everyDeepCopyType() map[string]any {
 		"ReportReference":                 populated[podtracev1alpha1.ReportReference](),
 		"SecretKeySelector":               populated[podtracev1alpha1.SecretKeySelector](),
 		"SessionJobRef":                   populated[podtracev1alpha1.SessionJobRef](),
+		"SessionNodeReport":               populated[podtracev1alpha1.SessionNodeReport](),
 		"SessionRuntimeSpec":              populated[podtracev1alpha1.SessionRuntimeSpec](),
 		"SessionSummary":                  populated[podtracev1alpha1.SessionSummary](),
 		"SplunkExporter":                  populated[podtracev1alpha1.SplunkExporter](),

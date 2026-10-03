@@ -4,10 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
-	"time"
 
-	"github.com/prometheus/client_golang/prometheus"
-	dto "github.com/prometheus/client_model/go"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -143,51 +140,5 @@ func TestSessionJobName_EmptyNodeFallsBackToHashOnly(t *testing.T) {
 	}
 	if strings.HasSuffix(name, "-") {
 		t.Fatalf("Job name %q must not end in a dash", name)
-	}
-}
-
-func durationSampleCount(t *testing.T, backend, result string) uint64 {
-	t.Helper()
-	obs, err := reportUploadDuration.GetMetricWithLabelValues(backend, result)
-	if err != nil {
-		t.Fatalf("GetMetricWithLabelValues: %v", err)
-	}
-	m, ok := obs.(prometheus.Metric)
-	if !ok {
-		t.Fatal("histogram observer is not a prometheus.Metric")
-	}
-	var pb dto.Metric
-	if err := m.Write(&pb); err != nil {
-		t.Fatalf("Write: %v", err)
-	}
-	return pb.GetHistogram().GetSampleCount()
-}
-
-func TestObserveReportUploadMetrics_ObservesDurationWhenStarted(t *testing.T) {
-	reset := func() {
-		forgetReportObservations("ns-dur", "s-dur")
-		reportUploadAttempts.Reset()
-		reportUploadDuration.Reset()
-	}
-	reset()
-	defer reset()
-
-	s := &podtracev1alpha1.PodTraceSession{}
-	s.Name, s.Namespace = "s-dur", "ns-dur"
-	s.Spec.ReportRef = &podtracev1alpha1.ReportReference{
-		ObjectStore: &podtracev1alpha1.ObjectStoreReference{URI: "s3://b/k/"},
-	}
-	start := metav1.NewTime(time.Now().Add(-2 * time.Second))
-	s.Status.StartTime = &start
-
-	observeReportUploadMetrics(s, reportUploadObservation{
-		ResolvedURI: "s3://b/k/r.txt",
-		Terminated:  true,
-		Succeeded:   true,
-		Attempts:    1,
-	})
-
-	if got := durationSampleCount(t, "s3", "success"); got != 1 {
-		t.Errorf("duration histogram sample count = %d, want 1 once StartTime is set", got)
 	}
 }
