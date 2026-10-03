@@ -260,19 +260,19 @@ func TestTriggerDefaults(t *testing.T) {
 }
 
 func TestTriggeredSessionName(t *testing.T) {
-	at := time.Unix(1753617600, 0)
-	a := triggeredSessionName("nightly", "prod", "checkout-7f", at)
-	b := triggeredSessionName("nightly", "prod", "checkout-7f", at)
+	key := "uid:27d43f0a-9e51-4b6e-8f26-f4f43c8d05f2"
+	a := triggeredSessionName("nightly", key)
+	b := triggeredSessionName("nightly", key)
 	if a != b {
 		t.Errorf("not deterministic: %q vs %q", a, b)
 	}
 	if len(a) > 63 {
 		t.Errorf("name %q exceeds 63 chars", a)
 	}
-	if c := triggeredSessionName("nightly", "prod", "other-pod", at); c == a {
-		t.Error("different pods must yield different names")
+	if c := triggeredSessionName("nightly", "uid:00000000-0000-0000-0000-000000000001"); c == a {
+		t.Error("different occurrence keys must yield different names")
 	}
-	long := triggeredSessionName("this-is-a-very-long-schedule-name-that-exceeds-the-k8s-limit-easily", "prod", "p", at)
+	long := triggeredSessionName("this-is-a-very-long-schedule-name-that-exceeds-the-k8s-limit-easily", key)
 	if len(long) > 63 {
 		t.Errorf("long schedule name not bounded: %d chars", len(long))
 	}

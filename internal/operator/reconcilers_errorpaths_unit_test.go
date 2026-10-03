@@ -139,7 +139,7 @@ func TestErrPath_Schedule_GcOldestDeleteError(t *testing.T) {
 		completedSession("old", fixedScheduleNow.Add(-2*time.Hour)),
 		completedSession("new", fixedScheduleNow.Add(-1*time.Hour)),
 	}
-	if err := r.gcOldest(context.Background(), sessions, 1); err == nil {
+	if err := r.gcOldest(context.Background(), &podtracev1alpha1.PodTraceSchedule{}, sessions, 1); err == nil {
 		t.Fatal("expected gcOldest to surface Delete error")
 	}
 }

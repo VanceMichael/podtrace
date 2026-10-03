@@ -164,6 +164,14 @@ type TriggerSpec struct {
 // per-pod cooldown and the rolling-hour rate cap idempotently across
 // reconciles.
 type TriggerFiring struct {
+	// OccurrenceKey is the stable identity of the Kubernetes Event occurrence
+	// whose single consumption produced this firing. The controller writes it
+	// when a triggered session is created and uses it to reject replays of
+	// that Event (watch re-delivery, list fallback, ResourceVersion updates)
+	// even after the child session itself has been garbage-collected.
+	// +optional
+	OccurrenceKey string `json:"occurrenceKey,omitempty"`
+
 	// +kubebuilder:validation:Required
 	PodName string `json:"podName"`
 

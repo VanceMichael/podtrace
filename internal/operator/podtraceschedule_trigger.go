@@ -111,6 +111,18 @@ func effectiveMinSeverity(s string) string {
 	return s
 }
 
+// Receipt annotation names. The child session carries the receipt of the
+// exact Event occurrence it consumed, so a firing can be recovered from the
+// session alone when the schedule status write was lost.
+const (
+	AnnotationTriggerEventKey = "podtrace.io/trigger-event-key"
+
+	annotationTriggeredBy     = "podtrace.io/triggered-by"
+	annotationTriggerSeverity = "podtrace.io/trigger-severity"
+	annotationTriggerPod      = "podtrace.io/trigger-pod"
+	annotationTriggeredAt     = "podtrace.io/triggered-at"
+)
+
 // alertEvent is the parsed, trigger-relevant view of a Kubernetes Event.
 type alertEvent struct {
 	Namespace string
@@ -118,6 +130,11 @@ type alertEvent struct {
 	Kind      podtracev1alpha1.TriggerSourceKind
 	Severity  string
 	At        time.Time
+
+	// Key is the stable identity of this Event occurrence: identical across
+	// watch replays, list fallback and ResourceVersion/LastTimestamp updates
+	// of the same object; distinct for genuinely new occurrences.
+	Key string
 }
 
 // parseAlertEvent extracts the trigger view from a raw Event, or false when
@@ -143,7 +160,91 @@ func parseAlertEvent(ev *corev1.Event) (alertEvent, bool) {
 		Kind:      kind,
 		Severity:  ev.Annotations[alerting.AnnotationAlertSeverity],
 		At:        eventTime(ev),
+		Key:       eventOccurrenceKey(ev, ns, ev.InvolvedObject.Name, kind),
 	}, true
+}
+
+// eventOccurrenceKey establishes a stable identity for one triggerable
+// Kubernetes Event occurrence. The apiserver always assigns a UID, so the
+// key survives watch replays, list fallback and ResourceVersion updates —
+// including LastTimestamp/Count mutations of the same aggregated Event.
+// Objects without a UID (test fakes) fall back to a content composite built
+// from immutable timestamps, never the mutable LastTimestamp alone.
+func eventOccurrenceKey(ev *corev1.Event, namespace, pod string, kind podtracev1alpha1.TriggerSourceKind) string {
+	if len(ev.UID) > 0 {
+		return "uid:" + string(ev.UID)
+	}
+	stamp := eventTime(ev)
+	switch {
+	case !ev.CreationTimestamp.IsZero():
+		stamp = ev.CreationTimestamp.Time
+	case !ev.FirstTimestamp.IsZero():
+		stamp = ev.FirstTimestamp.Time
+	}
+	return "composite:" + namespace + "/" + pod + "/" + string(kind) + "/" + stamp.UTC().Format(time.RFC3339Nano)
+}
+
+// parseTriggerPodRef recovers the alerting pod coordinates from a session's
+// trigger-pod receipt ("namespace/name").
+func parseTriggerPodRef(ref string) (namespace, pod string) {
+	parts := strings.SplitN(ref, "/", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return "", ""
+	}
+	return parts[0], parts[1]
+}
+
+// firingByKey returns the ledger entry that consumed the given occurrence,
+// or nil.
+func firingByKey(firings []podtracev1alpha1.TriggerFiring, key string) *podtracev1alpha1.TriggerFiring {
+	for i := range firings {
+		if firings[i].OccurrenceKey == key {
+			return &firings[i]
+		}
+	}
+	return nil
+}
+
+// buildTriggerLedger merges firing evidence recoverable from the schedule's
+// child sessions with the persisted recentFirings into a single deduplicated,
+// time-ordered ledger. A child session's receipt is authoritative proof that
+// its occurrence was consumed — this is what recovers a firing whose status
+// write was lost. Status entries with no matching child are kept for sessions
+// already garbage-collected after their receipt was persisted.
+func buildTriggerLedger(children []podtracev1alpha1.PodTraceSession, persisted []podtracev1alpha1.TriggerFiring) []podtracev1alpha1.TriggerFiring {
+	seen := map[string]struct{}{}
+	var out []podtracev1alpha1.TriggerFiring
+	for i := range children {
+		s := &children[i]
+		key := s.Annotations[AnnotationTriggerEventKey]
+		if key == "" {
+			continue
+		}
+		ns, pod := parseTriggerPodRef(s.Annotations[annotationTriggerPod])
+		if ns == "" || pod == "" {
+			continue
+		}
+		out = append(out, podtracev1alpha1.TriggerFiring{
+			OccurrenceKey: key,
+			Namespace:     ns,
+			PodName:       pod,
+			Time:          metav1.NewTime(s.CreationTimestamp.Time),
+			SessionName:   s.Name,
+		})
+		seen[key] = struct{}{}
+	}
+	for i := range persisted {
+		f := persisted[i]
+		if f.OccurrenceKey != "" {
+			if _, ok := seen[f.OccurrenceKey]; ok {
+				continue
+			}
+			seen[f.OccurrenceKey] = struct{}{}
+		}
+		out = append(out, f)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Time.Before(&out[j].Time) })
+	return out
 }
 
 // eventTime returns the most recent observation time recorded on the Event.
@@ -250,19 +351,33 @@ func triggerConcurrency(t *podtracev1alpha1.TriggerSpec) podtracev1alpha1.Concur
 }
 
 // reconcileTrigger drives event-driven ("flight recorder") session creation.
+// Every triggerable Event occurrence is consumed at most once: replays only
+// associate with the session that consumed it, while cooldown and the
+// rolling-hour cap are computed from a single merged ledger.
 func (r *PodTraceScheduleReconciler) reconcileTrigger(ctx context.Context, sch *podtracev1alpha1.PodTraceSchedule, active, succeeded, failed []podtracev1alpha1.PodTraceSession, now time.Time) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 	tr := sch.Spec.Trigger
 	cooldown := triggerCooldown(tr)
 
+	// GC first; its guard never removes a session while it is the sole
+	// recovery evidence for an occurrence whose receipt is not yet
+	// persisted and can still be replayed.
 	if err := r.applyHistoryLimits(ctx, sch, succeeded, failed); err != nil {
 		return ctrl.Result{}, err
 	}
 
+	// Single ledger: receipts recovered from every existing child session
+	// merged with the persisted firing log. Building it before any other
+	// step ensures a firing lost from status is recovered on this pass even
+	// when a later branch returns early.
+	ledger := buildTriggerLedger(
+		append(append(append([]podtracev1alpha1.PodTraceSession{}, active...), succeeded...), failed...),
+		triggerFirings(sch))
+
 	namespaces, deniedNamespaces, err := r.triggerNamespaces(ctx, sch)
 	if err != nil {
 		r.setCondition(sch, ConditionDegraded, metav1.ConditionTrue, "NamespaceSelectorInvalid", err.Error())
-		return ctrl.Result{RequeueAfter: triggerResyncInterval}, r.finishTriggerStatus(ctx, sch, active, now, cooldown)
+		return ctrl.Result{RequeueAfter: triggerResyncInterval}, r.finishTriggerStatus(ctx, sch, active, ledger, now, cooldown)
 	}
 	if len(deniedNamespaces) > 0 {
 		r.setCondition(sch, ConditionDegraded, metav1.ConditionFalse, "SomeNamespacesDenied",
@@ -287,31 +402,44 @@ func (r *PodTraceScheduleReconciler) reconcileTrigger(ctx context.Context, sch *
 		if len(active) > 0 {
 			r.setCondition(sch, ConditionReconciled, metav1.ConditionTrue, "Forbidden",
 				fmt.Sprintf("%d active triggered session(s); not firing", len(active)))
-			return ctrl.Result{RequeueAfter: triggerResyncInterval}, r.finishTriggerStatus(ctx, sch, active, now, cooldown)
+			return ctrl.Result{RequeueAfter: triggerResyncInterval}, r.finishTriggerStatus(ctx, sch, active, ledger, now, cooldown)
 		}
 	case podtracev1alpha1.ReplaceConcurrent:
+		// The active sessions are evidence for the occurrences they
+		// consumed. Persist their receipts into the ledger BEFORE deleting
+		// them, so replays stay rejected and their firings keep counting
+		// toward cooldown and the rate window after replacement.
+		sch.Status.Trigger = &podtracev1alpha1.TriggerStatus{RecentFirings: ledger}
+		if err := r.patchStatus(ctx, sch); err != nil {
+			return ctrl.Result{}, err
+		}
 		for i := range active {
 			if err := r.Delete(ctx, &active[i]); err != nil && !apierrors.IsNotFound(err) {
 				return ctrl.Result{}, fmt.Errorf("replace: delete active session %s: %w", active[i].Name, err)
 			}
 		}
+		active = nil
 	}
 
-	firings := triggerFirings(sch)
 	maxPerHour := triggerMaxPerHour(tr)
-	remaining := int(maxPerHour) - countFiringsInWindow(firings, now, triggerRateWindow)
+	remaining := int(maxPerHour) - countFiringsInWindow(ledger, now, triggerRateWindow)
 	firedThisPass := 0
 	rateLimited := false
 
 	for _, ev := range eligible {
+		// Already consumed (child session, persisted firing, or both):
+		// associate with the original session; never create or count again.
+		if firingByKey(ledger, ev.Key) != nil {
+			continue
+		}
 		if remaining <= 0 {
 			rateLimited = true
 			break
 		}
-		if !eligibleToFire(lastFiringForPod(firings, ev.Namespace, ev.PodName), ev.At, now, cooldown) {
+		if !eligibleToFire(lastFiringForPod(ledger, ev.Namespace, ev.PodName), ev.At, now, cooldown) {
 			continue
 		}
-		session, err := r.ensureTriggeredSession(ctx, sch, ev)
+		session, created, err := r.ensureTriggeredSession(ctx, sch, ev)
 		if err != nil {
 			if apierrors.IsForbidden(err) && strings.Contains(err.Error(), "being terminated") {
 				logger.Info("namespace terminating; stopping trigger reconcile", "err", err)
@@ -320,11 +448,18 @@ func (r *PodTraceScheduleReconciler) reconcileTrigger(ctx context.Context, sch *
 			r.setCondition(sch, ConditionDegraded, metav1.ConditionTrue, "CreateSession", err.Error())
 			return ctrl.Result{}, err
 		}
-		firings = append(firings, podtracev1alpha1.TriggerFiring{
-			PodName:     ev.PodName,
-			Namespace:   ev.Namespace,
-			Time:        metav1.NewTime(now),
-			SessionName: session,
+		// Only the API-confirmed creator records the firing: a concurrent
+		// reconciler that lost the create race (AlreadyExists surfaced as
+		// an unchanged pre-existing session) just associates with it.
+		if !created {
+			continue
+		}
+		ledger = append(ledger, podtracev1alpha1.TriggerFiring{
+			OccurrenceKey: ev.Key,
+			PodName:       ev.PodName,
+			Namespace:     ev.Namespace,
+			Time:          metav1.NewTime(now),
+			SessionName:   session,
 		})
 		remaining--
 		firedThisPass++
@@ -332,7 +467,7 @@ func (r *PodTraceScheduleReconciler) reconcileTrigger(ctx context.Context, sch *
 			"kind", ev.Kind, "severity", ev.Severity)
 	}
 
-	sch.Status.Trigger = &podtracev1alpha1.TriggerStatus{RecentFirings: pruneFirings(firings, now, cooldown)}
+	sch.Status.Trigger = &podtracev1alpha1.TriggerStatus{RecentFirings: pruneFirings(ledger, now, cooldown)}
 
 	switch {
 	case rateLimited:
@@ -346,15 +481,14 @@ func (r *PodTraceScheduleReconciler) reconcileTrigger(ctx context.Context, sch *
 			"no matching alert eligible to fire")
 	}
 
-	return ctrl.Result{RequeueAfter: triggerResyncInterval}, r.finishTriggerStatus(ctx, sch, active, now, cooldown)
+	return ctrl.Result{RequeueAfter: triggerResyncInterval}, r.finishTriggerStatus(ctx, sch, active, ledger, now, cooldown)
 }
 
-// finishTriggerStatus refreshes active-session status and persists.
-func (r *PodTraceScheduleReconciler) finishTriggerStatus(ctx context.Context, sch *podtracev1alpha1.PodTraceSchedule, active []podtracev1alpha1.PodTraceSession, now time.Time, cooldown time.Duration) error {
+// finishTriggerStatus refreshes active-session status and persists the
+// merged firing ledger.
+func (r *PodTraceScheduleReconciler) finishTriggerStatus(ctx context.Context, sch *podtracev1alpha1.PodTraceSchedule, active []podtracev1alpha1.PodTraceSession, ledger []podtracev1alpha1.TriggerFiring, now time.Time, cooldown time.Duration) error {
 	r.refreshStatus(sch, active, nil)
-	if sch.Status.Trigger == nil {
-		sch.Status.Trigger = &podtracev1alpha1.TriggerStatus{RecentFirings: pruneFirings(triggerFirings(sch), now, cooldown)}
-	}
+	sch.Status.Trigger = &podtracev1alpha1.TriggerStatus{RecentFirings: pruneFirings(ledger, now, cooldown)}
 	return r.patchStatus(ctx, sch)
 }
 
@@ -399,14 +533,10 @@ func (r *PodTraceScheduleReconciler) listAlertEvents(ctx context.Context, namesp
 			if !ok {
 				continue
 			}
-			key := string(list.Items[i].UID)
-			if key == "" {
-				key = parsed.Namespace + "/" + parsed.PodName + "/" + string(parsed.Kind) + "/" + parsed.At.String()
-			}
-			if _, dup := seen[key]; dup {
+			if _, dup := seen[parsed.Key]; dup {
 				continue
 			}
-			seen[key] = struct{}{}
+			seen[parsed.Key] = struct{}{}
 			out = append(out, parsed)
 		}
 	}
@@ -447,14 +577,17 @@ func (r *PodTraceScheduleReconciler) filterEligibleEvents(ctx context.Context, s
 	return out, nil
 }
 
-// ensureTriggeredSession creates (idempotently) a PodTraceSession that traces
-// the alerting pod, stamped with the triggering-alert context.
-func (r *PodTraceScheduleReconciler) ensureTriggeredSession(ctx context.Context, sch *podtracev1alpha1.PodTraceSchedule, ev alertEvent) (string, error) {
-	name := triggeredSessionName(sch.Name, ev.Namespace, ev.PodName, ev.At)
+// ensureTriggeredSession creates, idempotently and deterministically named,
+// a PodTraceSession that traces the alerting pod. The trigger receipt is
+// written only at creation. The boolean reports whether THIS call was the
+// API-confirmed creator; a concurrent reconciler that raced on the same
+// deterministic name gets false and must not count the firing.
+func (r *PodTraceScheduleReconciler) ensureTriggeredSession(ctx context.Context, sch *podtracev1alpha1.PodTraceSchedule, ev alertEvent) (string, bool, error) {
+	name := triggeredSessionName(sch.Name, ev.Key)
 	session := &podtracev1alpha1.PodTraceSession{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: sch.Namespace},
 	}
-	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, session, func() error {
+	op, err := controllerutil.CreateOrUpdate(ctx, r.Client, session, func() error {
 		if session.CreationTimestamp.IsZero() {
 			session.Spec = *sch.Spec.SessionTemplate.Spec.DeepCopy()
 			session.Spec.Selector = nil
@@ -474,26 +607,32 @@ func (r *PodTraceScheduleReconciler) ensureTriggeredSession(ctx context.Context,
 		for k, v := range sch.Spec.SessionTemplate.Metadata.Annotations {
 			anns[k] = v
 		}
-		anns["podtrace.io/triggered-by"] = string(ev.Kind)
-		anns["podtrace.io/trigger-severity"] = ev.Severity
-		anns["podtrace.io/trigger-pod"] = ev.Namespace + "/" + ev.PodName
-		anns["podtrace.io/triggered-at"] = ev.At.UTC().Format(time.RFC3339)
+		// Receipt fields identify the exact occurrence; stamp them once,
+		// at creation, so later reconciles never overwrite recovery data.
+		if session.CreationTimestamp.IsZero() {
+			anns[AnnotationTriggerEventKey] = ev.Key
+			anns[annotationTriggeredBy] = string(ev.Kind)
+			anns[annotationTriggerSeverity] = ev.Severity
+			anns[annotationTriggerPod] = ev.Namespace + "/" + ev.PodName
+			anns[annotationTriggeredAt] = ev.At.UTC().Format(time.RFC3339)
+		}
 		session.Annotations = mergeLabels(session.Annotations, anns)
 
 		return controllerutil.SetControllerReference(sch, session, r.Scheme)
 	})
 	if err != nil {
-		return "", fmt.Errorf("ensure triggered session for %s/%s: %w", ev.Namespace, ev.PodName, err)
+		return "", false, fmt.Errorf("ensure triggered session for %s/%s: %w", ev.Namespace, ev.PodName, err)
 	}
-	return name, nil
+	return name, op == controllerutil.OperationResultCreated, nil
 }
 
-// triggeredSessionName is deterministic per (schedule, pod, alert time) so a
-// re-reconcile of the same alert is idempotent, and bounded to 63 chars.
-func triggeredSessionName(scheduleName, namespace, pod string, at time.Time) string {
+// triggeredSessionName is deterministic per (schedule, occurrence key) so a
+// re-reconcile of the same Event is idempotent even if its LastTimestamp or
+// ResourceVersion changed, and bounded to 63 chars.
+func triggeredSessionName(scheduleName, occurrenceKey string) string {
 	h := fnv.New32a()
-	_, _ = h.Write([]byte(namespace + "/" + pod))
-	suffix := fmt.Sprintf("-%08x-%d", h.Sum32(), at.Unix())
+	_, _ = h.Write([]byte(occurrenceKey))
+	suffix := fmt.Sprintf("-%08x", h.Sum32())
 	head := scheduleName
 	if len(head)+len(suffix) > 63 {
 		head = head[:63-len(suffix)]

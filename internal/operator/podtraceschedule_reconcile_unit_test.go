@@ -253,7 +253,7 @@ func TestApplyHistoryLimits_GCOldest(t *testing.T) {
 		t.Errorf("failed sessions should be fully GCed (keep=0): %v", remaining)
 	}
 
-	if err := r.gcOldest(ctx, []podtracev1alpha1.PodTraceSession{*newSucc}, 5); err != nil {
+	if err := r.gcOldest(ctx, sch, []podtracev1alpha1.PodTraceSession{*newSucc}, 5); err != nil {
 		t.Fatalf("gcOldest no-op error = %v", err)
 	}
 }

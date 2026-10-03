@@ -406,30 +406,75 @@ func scheduledSessionName(scheduleName string, runTime time.Time) string {
 
 func (r *PodTraceScheduleReconciler) applyHistoryLimits(ctx context.Context, sch *podtracev1alpha1.PodTraceSchedule, succeeded, failed []podtracev1alpha1.PodTraceSession) error {
 	if lim := sch.Spec.SuccessfulSessionsHistoryLimit; lim != nil {
-		if err := r.gcOldest(ctx, succeeded, int(*lim)); err != nil {
+		if err := r.gcOldest(ctx, sch, succeeded, int(*lim)); err != nil {
 			return fmt.Errorf("gc successful: %w", err)
 		}
 	}
 	if lim := sch.Spec.FailedSessionsHistoryLimit; lim != nil {
-		if err := r.gcOldest(ctx, failed, int(*lim)); err != nil {
+		if err := r.gcOldest(ctx, sch, failed, int(*lim)); err != nil {
 			return fmt.Errorf("gc failed: %w", err)
 		}
 	}
 	return nil
 }
 
-func (r *PodTraceScheduleReconciler) gcOldest(ctx context.Context, sessions []podtracev1alpha1.PodTraceSession, keep int) error {
+func (r *PodTraceScheduleReconciler) gcOldest(ctx context.Context, sch *podtracev1alpha1.PodTraceSchedule, sessions []podtracev1alpha1.PodTraceSession, keep int) error {
 	if len(sessions) <= keep {
 		return nil
 	}
 	sortByCompletion(sessions) // ascending: oldest first
 	toDelete := sessions[:len(sessions)-keep]
+
+	persistedKeys := persistedFiringKeys(sch)
+	horizon := triggerRetentionHorizon(sch)
+	now := r.now()
+
 	for i := range toDelete {
-		if err := r.Delete(ctx, &toDelete[i]); err != nil && !apierrors.IsNotFound(err) {
-			return fmt.Errorf("delete %s: %w", toDelete[i].Name, err)
+		s := &toDelete[i]
+		// A triggered session is evidence of the occurrence it consumed.
+		// Do not remove it while its receipt is not yet persisted in the
+		// firing ledger and the occurrence could still be replayed
+		// (within the retention horizon): wait for the ledger to persist
+		// the receipt first. Older than the horizon, the Event can no
+		// longer be listed or affect cooldown/rate, so removal is safe
+		// even though the entry has since been pruned.
+		if key := s.Annotations[AnnotationTriggerEventKey]; key != "" {
+			if _, persisted := persistedKeys[key]; !persisted && now.Sub(s.CreationTimestamp.Time) <= horizon {
+				continue
+			}
+		}
+		if err := r.Delete(ctx, s); err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("delete %s: %w", s.Name, err)
 		}
 	}
 	return nil
+}
+
+// persistedFiringKeys returns the occurrence keys already safely stored in
+// the schedule's firing ledger; those occurrences can be rejected on replay
+// without their child session.
+func persistedFiringKeys(sch *podtracev1alpha1.PodTraceSchedule) map[string]struct{} {
+	out := map[string]struct{}{}
+	if sch.Status.Trigger != nil {
+		for i := range sch.Status.Trigger.RecentFirings {
+			if key := sch.Status.Trigger.RecentFirings[i].OccurrenceKey; key != "" {
+				out[key] = struct{}{}
+			}
+		}
+	}
+	return out
+}
+
+// triggerRetentionHorizon is how long evidence for an occurrence must be
+// retained: the rate window, extended by the cooldown when it is longer.
+func triggerRetentionHorizon(sch *podtracev1alpha1.PodTraceSchedule) time.Duration {
+	horizon := triggerRateWindow
+	if sch.Spec.Trigger != nil {
+		if cd := triggerCooldown(sch.Spec.Trigger); cd > horizon {
+			horizon = cd
+		}
+	}
+	return horizon
 }
 
 func sortByCompletion(sessions []podtracev1alpha1.PodTraceSession) {

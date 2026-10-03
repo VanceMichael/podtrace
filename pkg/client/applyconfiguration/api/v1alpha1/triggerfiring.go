@@ -28,16 +28,25 @@ import (
 // per-pod cooldown and the rolling-hour rate cap idempotently across
 // reconciles.
 type TriggerFiringApplyConfiguration struct {
-	PodName     *string  `json:"podName,omitempty"`
-	Namespace   *string  `json:"namespace,omitempty"`
-	Time        *v1.Time `json:"time,omitempty"`
-	SessionName *string  `json:"sessionName,omitempty"`
+	OccurrenceKey *string  `json:"occurrenceKey,omitempty"`
+	PodName       *string  `json:"podName,omitempty"`
+	Namespace     *string  `json:"namespace,omitempty"`
+	Time          *v1.Time `json:"time,omitempty"`
+	SessionName   *string  `json:"sessionName,omitempty"`
 }
 
-// TriggerFiringApplyConfiguration constructs a declarative configuration of the TriggerFiring type for use with
-// apply.
+// TriggerFiringApplyConfiguration constructs a declarative configuration of the TriggerFiring type for use
+// with apply.
 func TriggerFiring() *TriggerFiringApplyConfiguration {
 	return &TriggerFiringApplyConfiguration{}
+}
+
+// WithOccurrenceKey sets the OccurrenceKey field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the OccurrenceKey field is set to the value of the last call.
+func (b *TriggerFiringApplyConfiguration) WithOccurrenceKey(value string) *TriggerFiringApplyConfiguration {
+	b.OccurrenceKey = &value
+	return b
 }
 
 // WithPodName sets the PodName field in the declarative configuration to the given value

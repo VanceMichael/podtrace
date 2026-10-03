@@ -728,6 +728,14 @@ spec:
                       properties:
                         namespace:
                           type: string
+                        occurrenceKey:
+                          description: |-
+                            OccurrenceKey is the stable identity of the Kubernetes Event occurrence
+                            whose single consumption produced this firing. The controller writes it
+                            when a triggered session is created and uses it to reject replays of
+                            that Event (watch re-delivery, list fallback, ResourceVersion updates)
+                            even after the child session itself has been garbage-collected.
+                          type: string
                         podName:
                           type: string
                         sessionName:
