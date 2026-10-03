@@ -325,7 +325,19 @@ func buildDiagnoseArgs(s *podtracev1alpha1.PodTraceSession, targets sessionTarge
 		args = append(args, "--tracing-sample-rate", strconv.FormatFloat(float64(*s.Spec.SamplePercent)/100.0, 'f', 2, 64))
 	}
 
-	if s.Spec.Selector != nil {
+	// When the session carries a target snapshot (every normal session
+	// after its first non-empty resolution), the Job enumerates the
+	// frozen pods explicitly instead of re-expanding a live selector:
+	// pods a rollout starts after the snapshot must not be absorbed into
+	// this bounded diagnose run. Explicit podRefs are unioned in so a
+	// user-named pod that appears after the snapshot keeps the
+	// pre-snapshot podRefs behavior. The selector flags remain only for
+	// the narrow upgrade edge where a pre-snapshot session needs a Job
+	// backfilled but has no live pods to enumerate.
+	frozenRefs := frozenPodRefs(targets, s.Namespace)
+	if len(frozenRefs) > 0 {
+		args = append(args, "--pods", strings.Join(frozenRefs, ","))
+	} else if s.Spec.Selector != nil {
 		args = append(args, "--pod-selector", labelSelectorToFlag(s.Spec.Selector))
 		args = append(args, "--all-in-namespace")
 		if len(targets.Namespaces) > 0 {
@@ -334,18 +346,35 @@ func buildDiagnoseArgs(s *podtracev1alpha1.PodTraceSession, targets sessionTarge
 			args = append(args, "--namespace", s.Namespace)
 		}
 	}
-	if len(targets.PodRefs) > 0 {
-		refs := make([]string, 0, len(targets.PodRefs))
-		for _, r := range targets.PodRefs {
-			if r.Namespace != "" {
-				refs = append(refs, r.Namespace+"/"+r.Name)
-			} else {
-				refs = append(refs, s.Namespace+"/"+r.Name)
-			}
-		}
-		args = append(args, "--pods", strings.Join(refs, ","))
-	}
 	return args
+}
+
+// frozenPodRefs renders the de-duplicated, sorted ns/name list the Job
+// pins to once a session has a target snapshot: the frozen running pods
+// plus the session's grant-authorized explicit podRefs.
+func frozenPodRefs(targets sessionTargets, defaultNamespace string) []string {
+	set := map[string]struct{}{}
+	add := func(namespace, name string) {
+		if name == "" {
+			return
+		}
+		if namespace == "" {
+			namespace = defaultNamespace
+		}
+		set[namespace+"/"+name] = struct{}{}
+	}
+	for _, p := range targets.Pods {
+		add(p.Namespace, p.Name)
+	}
+	for _, r := range targets.PodRefs {
+		add(r.Namespace, r.Name)
+	}
+	out := make([]string, 0, len(set))
+	for ref := range set {
+		out = append(out, ref)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // labelSelectorToFlag serializes the FULL selector, matchLabels and

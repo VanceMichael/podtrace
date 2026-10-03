@@ -545,6 +545,92 @@ spec:
                 items:
                   type: string
                 type: array
+              targetSnapshot:
+                description: |-
+                  TargetSnapshot freezes the grant-authorized target set on the
+                  first non-empty resolution and drives every downstream decision
+                  for the rest of the session's life.
+                properties:
+                  deniedNamespaces:
+                    items:
+                      type: string
+                    type: array
+                  namespaces:
+                    description: |-
+                      Namespaces is the frozen selector allowlist (the namespaces the
+                      in-Job CLI was authorized to read), as resolved at snapshot time.
+                    items:
+                      type: string
+                    type: array
+                  nodes:
+                    items:
+                      description: |-
+                        SessionTargetNode records one fan-out node together with the
+                        TracerConfig and system namespace resolved for it when the snapshot
+                        was taken, so later relabels or TracerConfig changes cannot move the
+                        node's Job to another namespace or config.
+                      properties:
+                        name:
+                          type: string
+                        systemNamespace:
+                          type: string
+                        tracerConfigName:
+                          type: string
+                      required:
+                      - name
+                      type: object
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - name
+                    x-kubernetes-list-type: map
+                  podRefs:
+                    description: |-
+                      PodRefs is the frozen grant-authorized spec.podRefs list (podRefs
+                      sessions only). Unlike selector-discovered pods, an explicitly
+                      named ref is a user-requested target: if it is not running yet at
+                      snapshot time but appears later, the existing podRefs behavior is
+                      preserved and the Job may still attach to it.
+                    items:
+                      description: PodRef references a specific pod by namespace/name.
+                      properties:
+                        name:
+                          type: string
+                        namespace:
+                          type: string
+                      required:
+                      - name
+                      type: object
+                    type: array
+                  pods:
+                    description: |-
+                      Pods is the frozen set of grant-authorized, running pods the
+                      session attached to. Job specs enumerate these explicitly instead
+                      of re-expanding the live selector.
+                    items:
+                      description: |-
+                        SessionTargetPod identifies one pod captured in a session's frozen
+                        target snapshot.
+                      properties:
+                        name:
+                          type: string
+                        namespace:
+                          type: string
+                        node:
+                          description: |-
+                            Node is the node the pod was scheduled on when the snapshot was
+                            taken. The session fan-out is pinned to this node set for the rest
+                            of the session's life.
+                          type: string
+                      required:
+                      - name
+                      - namespace
+                      - node
+                      type: object
+                    type: array
+                  resolvedAt:
+                    format: date-time
+                    type: string
+                type: object
             type: object
         type: object
     served: true

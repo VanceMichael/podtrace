@@ -139,7 +139,8 @@ func sessionRBACLabels(s *podtracev1alpha1.PodTraceSession) map[string]string {
 
 // sessionPodNamespaces returns the namespaces the in-Job CLI reads pods from
 // BEYOND the session's own namespace: the resolved namespaceSelector allowlist
-// (when spec.selector is set) plus any cross-namespace podRefs.
+// (when spec.selector is set), any cross-namespace podRefs, and the namespaces
+// of the frozen snapshot pods.
 func sessionPodNamespaces(s *podtracev1alpha1.PodTraceSession, targets sessionTargets) []string {
 	set := map[string]struct{}{}
 	if s.Spec.Selector != nil {
@@ -152,6 +153,11 @@ func sessionPodNamespaces(s *podtracev1alpha1.PodTraceSession, targets sessionTa
 	for _, ref := range targets.PodRefs {
 		if ref.Namespace != "" && ref.Namespace != s.Namespace {
 			set[ref.Namespace] = struct{}{}
+		}
+	}
+	for _, p := range targets.Pods {
+		if p.Namespace != "" && p.Namespace != s.Namespace {
+			set[p.Namespace] = struct{}{}
 		}
 	}
 	out := make([]string, 0, len(set))

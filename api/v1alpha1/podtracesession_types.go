@@ -104,6 +104,82 @@ type SessionJobRef struct {
 	Message string `json:"message,omitempty"`
 }
 
+// SessionTargetPod identifies one pod captured in a session's frozen
+// target snapshot.
+type SessionTargetPod struct {
+	// +kubebuilder:validation:Required
+	Namespace string `json:"namespace"`
+
+	// +kubebuilder:validation:Required
+	Name string `json:"name"`
+
+	// Node is the node the pod was scheduled on when the snapshot was
+	// taken. The session fan-out is pinned to this node set for the rest
+	// of the session's life.
+	// +kubebuilder:validation:Required
+	Node string `json:"node"`
+}
+
+// SessionTargetNode records one fan-out node together with the
+// TracerConfig and system namespace resolved for it when the snapshot
+// was taken, so later relabels or TracerConfig changes cannot move the
+// node's Job to another namespace or config.
+type SessionTargetNode struct {
+	// +kubebuilder:validation:Required
+	Name string `json:"name"`
+
+	// +optional
+	TracerConfigName string `json:"tracerConfigName,omitempty"`
+
+	// +optional
+	SystemNamespace string `json:"systemNamespace,omitempty"`
+}
+
+// SessionTargetSnapshot is the immutable, grant-authorized target set a
+// session resolved on its first non-empty match. Once persisted, every
+// downstream decision — per-node TracerConfig and system namespace,
+// exporter/object-store resources, pod-read RBAC, capacity checks, Job
+// creation and backfill, the completion denominator, and the summary —
+// is derived from this snapshot instead of the live selector, so a
+// workload rollout or pod/node disappearing mid-session can neither
+// absorb new pods nor complete the session early.
+//
+// Namespaces rejected by the consent check at first resolution are
+// reported through DeniedNamespaces but never enter Nodes/Namespaces.
+type SessionTargetSnapshot struct {
+	// +optional
+	// +patchMergeKey=name
+	// +patchStrategy=merge
+	// +listType=map
+	// +listMapKey=name
+	Nodes []SessionTargetNode `json:"nodes,omitempty" patchStrategy:"merge" patchMergeKey:"name"`
+
+	// Namespaces is the frozen selector allowlist (the namespaces the
+	// in-Job CLI was authorized to read), as resolved at snapshot time.
+	// +optional
+	Namespaces []string `json:"namespaces,omitempty"`
+
+	// Pods is the frozen set of grant-authorized, running pods the
+	// session attached to. Job specs enumerate these explicitly instead
+	// of re-expanding the live selector.
+	// +optional
+	Pods []SessionTargetPod `json:"pods,omitempty"`
+
+	// PodRefs is the frozen grant-authorized spec.podRefs list (podRefs
+	// sessions only). Unlike selector-discovered pods, an explicitly
+	// named ref is a user-requested target: if it is not running yet at
+	// snapshot time but appears later, the existing podRefs behavior is
+	// preserved and the Job may still attach to it.
+	// +optional
+	PodRefs []PodRef `json:"podRefs,omitempty"`
+
+	// +optional
+	DeniedNamespaces []string `json:"deniedNamespaces,omitempty"`
+
+	// +optional
+	ResolvedAt *metav1.Time `json:"resolvedAt,omitempty"`
+}
+
 // SessionSummary is a compact roll-up of what the session observed.
 type SessionSummary struct {
 	TotalEvents int64 `json:"totalEvents"`
@@ -137,6 +213,12 @@ type PodTraceSessionStatus struct {
 	Summary *SessionSummary `json:"summary,omitempty"`
 
 	TargetNamespaces []string `json:"targetNamespaces,omitempty"`
+
+	// TargetSnapshot freezes the grant-authorized target set on the
+	// first non-empty resolution and drives every downstream decision
+	// for the rest of the session's life.
+	// +optional
+	TargetSnapshot *SessionTargetSnapshot `json:"targetSnapshot,omitempty"`
 
 	// +optional
 	ReportLocation string `json:"reportLocation,omitempty"`

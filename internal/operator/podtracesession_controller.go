@@ -139,33 +139,74 @@ func (r *PodTraceSessionReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		}
 	}
 
-	targets, err := r.resolveSessionTargets(ctx, &session)
-	if err != nil {
-		if strings.Contains(err.Error(), "invalid NamespaceSelector") {
-			return ctrl.Result{}, r.failSessionTerminally(ctx, &session, "NamespaceSelectorInvalid", err.Error())
+	// Resolve the session's targets. The first non-empty,
+	// consent-passing resolution is frozen into status and drives the
+	// rest of the session for life: later reconciles, operator restarts,
+	// pod rebuilds, and label changes all consume that snapshot, so a
+	// rollout can neither pull new pods/nodes into this session nor
+	// shrink the fan-out and complete it early.
+	var targets sessionTargets
+	snap := session.Status.TargetSnapshot
+	if snap != nil {
+		targets = targetsFromSnapshot(snap)
+	} else {
+		var resolveErr error
+		targets, resolveErr = r.resolveSessionTargets(ctx, &session)
+		if resolveErr != nil {
+			if strings.Contains(resolveErr.Error(), "invalid NamespaceSelector") {
+				return ctrl.Result{}, r.failSessionTerminally(ctx, &session, "NamespaceSelectorInvalid", resolveErr.Error())
+			}
+			r.setCondition(&session, ConditionDegraded, metav1.ConditionTrue, "ResolveTargets", resolveErr.Error())
+			_ = r.Status().Update(ctx, &session)
+			return ctrl.Result{}, resolveErr
 		}
-		r.setCondition(&session, ConditionDegraded, metav1.ConditionTrue, "ResolveTargets", err.Error())
-		_ = r.Status().Update(ctx, &session)
-		return ctrl.Result{}, err
+		if len(targets.Nodes) == 0 && len(session.Status.Jobs) == 0 {
+			reason, message := "NoMatchedPods", "selector matched zero pods"
+			if len(targets.DeniedNamespaces) > 0 {
+				reason = "CrossNamespaceNotGranted"
+				message = crossNamespaceDeniedMessage(session.Namespace, targets.DeniedNamespaces)
+			}
+			if deadline := sessionPendingDeadline(&session); !deadline.IsZero() && r.now().After(deadline) {
+				return ctrl.Result{}, r.failSessionTerminally(ctx, &session, reason+"DeadlineExceeded",
+					fmt.Sprintf("%s; no pods matched within %s of creation", message, pendingMatchDeadline))
+			}
+			logger.Info("no matched pods; session stays Pending until pods appear", "reason", reason)
+			session.Status.State = podtracev1alpha1.SessionStatePending
+			r.setCondition(&session, ConditionReconciled, metav1.ConditionTrue, reason, message)
+			return ctrl.Result{RequeueAfter: 10 * time.Second}, r.Status().Update(ctx, &session)
+		}
+
+		if len(session.Status.Jobs) > 0 {
+			// Sessions started by an older operator release carry
+			// per-node Job refs but no snapshot. Seed the frozen node
+			// set from those refs so the upgrade itself cannot absorb a
+			// rollout; live resolution only contributes pods on those
+			// already-admitted nodes.
+			snap = migrateSnapshotFromStatus(&session, targets, r.now())
+		} else {
+			snap = newSessionTargetSnapshot(targets, r.now())
+		}
+		session.Status.TargetSnapshot = snap
+		session.Status.TargetNamespaces = targets.Namespaces
+		// Persist the snapshot BEFORE creating any child object: a
+		// crash between Job creates must restart from the same target
+		// set, not a re-expanded live selector.
+		if err := r.Status().Update(ctx, &session); err != nil {
+			if apierrors.IsConflict(err) {
+				return ctrl.Result{RequeueAfter: time.Second}, nil
+			}
+			return ctrl.Result{}, fmt.Errorf("persist session target snapshot: %w", err)
+		}
+		// The status write may replace nested status pointers with its
+		// own copies, so re-anchor the snapshot to what was persisted —
+		// later enrichment must land on session.Status.TargetSnapshot.
+		snap = session.Status.TargetSnapshot
 	}
 	session.Status.TargetNamespaces = targets.Namespaces
-	if len(targets.Nodes) == 0 {
-		reason, message := "NoMatchedPods", "selector matched zero pods"
-		if len(targets.DeniedNamespaces) > 0 {
-			reason = "CrossNamespaceNotGranted"
-			message = crossNamespaceDeniedMessage(session.Namespace, targets.DeniedNamespaces)
-		}
-		if deadline := sessionPendingDeadline(&session); !deadline.IsZero() && r.now().After(deadline) {
-			return ctrl.Result{}, r.failSessionTerminally(ctx, &session, reason+"DeadlineExceeded",
-				fmt.Sprintf("%s; no pods matched within %s of creation", message, pendingMatchDeadline))
-		}
-		logger.Info("no matched pods; session stays Pending until pods appear", "reason", reason)
-		session.Status.State = podtracev1alpha1.SessionStatePending
-		r.setCondition(&session, ConditionReconciled, metav1.ConditionTrue, reason, message)
-		return ctrl.Result{RequeueAfter: 10 * time.Second}, r.Status().Update(ctx, &session)
-	}
 
-	resolved, err := r.resolveSessionTracerConfigs(ctx, &session, targets.Nodes)
+	completedNodes := completedSessionNodes(session.Status.Jobs)
+
+	resolved, err := r.resolveSnapshotTracerConfigs(ctx, &session, snap, completedNodes)
 	if err != nil {
 		var missing *errNoTracerConfig
 		if errors.As(err, &missing) {
@@ -173,8 +214,9 @@ func (r *PodTraceSessionReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		}
 		return ctrl.Result{}, err
 	}
+	enrichSnapshotNodes(snap, resolved, r.SystemNamespace)
 	tc := resolved.primary()
-	systemNS := systemNamespaceForSession(tc, r.SystemNamespace)
+	systemNS := snapshotPrimarySystemNamespace(snap, r.SystemNamespace)
 
 	var ec podtracev1alpha1.ExporterConfig
 	hasExporter := session.Spec.ExporterRef.Name != ""
@@ -245,7 +287,7 @@ func (r *PodTraceSessionReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		}
 	}
 
-	completedNodes := completedSessionNodes(session.Status.Jobs)
+	completedNodes = completedSessionNodes(session.Status.Jobs)
 	jobs, err := r.ensureJobs(ctx, &session, resolved, targets, completedNodes)
 	if err != nil {
 		r.setCondition(&session, ConditionDegraded, metav1.ConditionTrue, "EnsureJobs", err.Error())
@@ -375,6 +417,12 @@ type sessionTargets struct {
 	Namespaces       []string
 	PodRefs          []podtracev1alpha1.PodRef
 	DeniedNamespaces []string
+	// Pods is the flat, de-duplicated set of grant-authorized, running
+	// pods (from both spec.selector and spec.podRefs) with the node each
+	// was scheduled on. It is what the target snapshot freezes so Job
+	// specs can enumerate pods explicitly instead of re-expanding a
+	// selector that a rollout could have changed by the time a Job runs.
+	Pods []podtracev1alpha1.SessionTargetPod
 }
 
 // resolveSessionTargets expands spec.selector / spec.podRefs into the
@@ -382,6 +430,17 @@ type sessionTargets struct {
 // namespaces the session is authorized to target.
 func (r *PodTraceSessionReconciler) resolveSessionTargets(ctx context.Context, s *podtracev1alpha1.PodTraceSession) (sessionTargets, error) {
 	nodes := map[string]struct{}{}
+	pods := map[string]podtracev1alpha1.SessionTargetPod{}
+	addPod := func(namespace, name, node string) {
+		if namespace == "" || name == "" || node == "" {
+			return
+		}
+		key := namespace + "/" + name
+		if _, ok := pods[key]; ok {
+			return
+		}
+		pods[key] = podtracev1alpha1.SessionTargetPod{Namespace: namespace, Name: name, Node: node}
+	}
 
 	targetNamespaces, deniedNamespaces, err := ResolveNamespaceSelector(ctx, r.Client, s.Spec.NamespaceSelector, s.Namespace)
 	if err != nil {
@@ -426,6 +485,7 @@ func (r *PodTraceSessionReconciler) resolveSessionTargets(ctx context.Context, s
 			for _, p := range list.Items {
 				if p.Spec.NodeName != "" && isPodEligible(&p) {
 					nodes[p.Spec.NodeName] = struct{}{}
+					addPod(p.Namespace, p.Name, p.Spec.NodeName)
 				}
 			}
 		case len(targetNamespaces) == 0:
@@ -445,6 +505,7 @@ func (r *PodTraceSessionReconciler) resolveSessionTargets(ctx context.Context, s
 				}
 				if p.Spec.NodeName != "" && isPodEligible(&p) {
 					nodes[p.Spec.NodeName] = struct{}{}
+					addPod(p.Namespace, p.Name, p.Spec.NodeName)
 				}
 			}
 		}
@@ -464,6 +525,7 @@ func (r *PodTraceSessionReconciler) resolveSessionTargets(ctx context.Context, s
 		}
 		if pod.Spec.NodeName != "" && isPodEligible(&pod) {
 			nodes[pod.Spec.NodeName] = struct{}{}
+			addPod(pod.Namespace, pod.Name, pod.Spec.NodeName)
 		}
 	}
 
@@ -472,11 +534,22 @@ func (r *PodTraceSessionReconciler) resolveSessionTargets(ctx context.Context, s
 		out = append(out, n)
 	}
 	sort.Strings(out)
+	podList := make([]podtracev1alpha1.SessionTargetPod, 0, len(pods))
+	for _, p := range pods {
+		podList = append(podList, p)
+	}
+	sort.Slice(podList, func(i, j int) bool {
+		if podList[i].Namespace != podList[j].Namespace {
+			return podList[i].Namespace < podList[j].Namespace
+		}
+		return podList[i].Name < podList[j].Name
+	})
 	return sessionTargets{
 		Nodes:            out,
 		Namespaces:       targetNamespaces,
 		PodRefs:          allowedPodRefs,
 		DeniedNamespaces: deniedNamespaces,
+		Pods:             podList,
 	}, nil
 }
 

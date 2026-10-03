@@ -103,6 +103,7 @@ can introspect a finished session without scraping pod logs:
 | `state` | `Pending` → `Running` → `Completed` / `Failed`. |
 | `startTime`, `completionTime` | Set when the first Job starts and last completes. |
 | `jobs[]` | One entry per node hosting a matched pod. Carries `node`, `name`, `completed`, `totalEvents`, `startTime`, `completionTime`. |
+| `targetSnapshot` | Immutable snapshot of the first non-empty, consent-authorized resolution: `nodes[]` (each with its frozen `tracerConfigName` + `systemNamespace`), `pods[]`, explicit `podRefs[]`, selector `namespaces[]`, and `deniedNamespaces[]`. Every later decision — Job fan-out/backfill, resources, RBAC, capacity, completion denominator — is driven by this snapshot, so a rollout or disappearing pod/node can neither absorb new workloads nor complete the session early. |
 | `summary` | Aggregated `{totalEvents, eventsByFilter, errorsDetected}` across all Jobs. `eventsByFilter` is keyed by filter name (`dns`, `net`, ...), so a new filter needs no schema change. |
 | `conditions` | Standard `Reconciled`, `Degraded`. |
 
